@@ -46,6 +46,11 @@ class Store:
         try:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript(Path(__file__).with_name('schema.sql').read_text(encoding='utf-8'))
+            db.execute('BEGIN IMMEDIATE')
+            if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(device)')}:
+                db.execute('ALTER TABLE device ADD COLUMN deleted_at TEXT')
+            db.execute('PRAGMA user_version=2')
+            db.commit()
         finally:
             db.close()
 
@@ -126,7 +131,7 @@ class Store:
                 yield stamp(begin), stamp(begin.replace(hour=end)), stamp(begin + timedelta(minutes=15))
 
     def slots(self, device_id):
-        devices = self.query('SELECT * FROM device WHERE id=?', (device_id,))
+        devices = self.query('SELECT * FROM device WHERE id=? AND deleted_at IS NULL', (device_id,))
         if not devices:
             raise BusinessError('NOT_FOUND', '设备不存在', 404)
         device = devices[0]
@@ -174,13 +179,13 @@ class Store:
                     raise BusinessError('KEY_CONFLICT', '幂等键已用于不同请求')
                 db.commit()
                 return json.loads(old['response_json']), old['response_code']
-            if operation in ('checkout', 'return', 'device'):
+            if operation in ('checkout', 'return', 'device', 'device_create', 'device_delete'):
                 self.admin(actor)
             now = stamp(self.clock())
             before = None
             if operation == 'reserve':
                 device = db.execute('SELECT * FROM device WHERE id=?', (payload['deviceId'],)).fetchone()
-                if not device:
+                if not device or device['deleted_at'] is not None:
                     raise BusinessError('NOT_FOUND', '设备不存在', 404)
                 if not device['enabled']:
                     raise BusinessError('DEVICE_DISABLED', '设备已停用')
@@ -197,9 +202,38 @@ class Store:
                     self.fault('after_occupancy')
                 after = 'CONFIRMED'
                 result, status = {'id': target, 'status': after}, 201
-            elif operation == 'device':
+            elif operation == 'device_create':
+                fields = {'asset_code': 64, 'name': 120, 'category': 60, 'description': 1000}
+                if set(payload) - fields.keys() or not {'asset_code', 'name', 'category'} <= payload.keys():
+                    raise BusinessError('INVALID_DEVICE', '请填写资产编号、名称和分类', 400)
+                values = {}
+                for field, limit in fields.items():
+                    value = payload.get(field, '')
+                    if not isinstance(value, str) or len(value.strip()) > limit or (field != 'description' and not value.strip()):
+                        raise BusinessError('INVALID_DEVICE', '设备字段为空、类型错误或超出长度限制', 400)
+                    values[field] = value.strip()
+                if db.execute('SELECT 1 FROM device WHERE asset_code=?', (values['asset_code'],)).fetchone():
+                    raise BusinessError('ASSET_CODE_EXISTS', '资产编号已存在（含已删除设备），请使用唯一编号')
+                target = db.execute('INSERT INTO device(asset_code,name,category,description) VALUES(?,?,?,?)',
+                                    tuple(values.values())).lastrowid
+                after = json.dumps(values, ensure_ascii=False)
+                result, status = {'id': target, **values, 'enabled': True}, 201
+            elif operation == 'device_delete':
                 device = db.execute('SELECT * FROM device WHERE id=?', (target,)).fetchone()
                 if not device:
+                    raise BusinessError('NOT_FOUND', '设备不存在', 404)
+                if payload:
+                    raise BusinessError('INVALID_BODY', '删除设备不接受额外参数', 400)
+                if device['current_loan_id'] is not None or db.execute("SELECT 1 FROM reservation WHERE device_id=? AND status IN ('CONFIRMED','BORROWED')", (target,)).fetchone():
+                    raise BusinessError('DEVICE_IN_USE', '设备有待领取预约或未归还借用，请先取消预约、等待过期或办理归还')
+                before = 'DELETED' if device['deleted_at'] else 'ACTIVE'
+                after = 'DELETED'
+                if not device['deleted_at']:
+                    db.execute('UPDATE device SET deleted_at=?,enabled=0 WHERE id=?', (now, target))
+                result, status = {'id': target, 'deleted': True}, 200
+            elif operation == 'device':
+                device = db.execute('SELECT * FROM device WHERE id=?', (target,)).fetchone()
+                if not device or device['deleted_at'] is not None:
                     raise BusinessError('NOT_FOUND', '设备不存在', 404)
                 if set(payload) != {'enabled'} or type(payload['enabled']) is not bool:
                     raise BusinessError('INVALID_BODY', '设备维护仅接受 enabled 布尔值', 400)

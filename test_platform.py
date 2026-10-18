@@ -189,6 +189,61 @@ class PlatformTests(unittest.TestCase):
         with self.assertRaises(BusinessError):
             self.reserve(start=stamp((self.now + timedelta(days=14)).replace(hour=14, minute=0, second=0)))
 
+    def test_device_create_delete_permissions_and_idempotency(self):
+        body = {'asset_code': 'NEW-001', 'name': '新相机', 'category': '影像设备', 'description': '说明'}
+        for action, payload, target in [('device_create', body, None), ('device_delete', {}, 1)]:
+            with self.assertRaises(BusinessError) as error:
+                self.store.mutate(self.user, action, 'denied', payload, target)
+            self.assertEqual(error.exception.status, 403)
+        result = self.store.mutate(self.admin, 'device_create', 'create', body)
+        self.assertEqual(result, self.store.mutate(self.admin, 'device_create', 'create', body))
+        target = result[0]['id']
+        with self.assertRaises(BusinessError) as error:
+            self.store.mutate(self.admin, 'device_create', 'duplicate', body)
+        self.assertEqual(error.exception.code, 'ASSET_CODE_EXISTS')
+        with self.assertRaises(BusinessError) as error:
+            self.store.mutate(self.admin, 'device_create', 'create', {**body, 'name': '不同内容'})
+        self.assertEqual(error.exception.code, 'KEY_CONFLICT')
+        self.assertEqual(len(self.store.slots(target)['slots']), 28)
+        self.op('device_delete', target, key='delete')
+        self.op('device_delete', target, key='delete')
+        self.op('device_delete', target)
+        for action, payload in [('device', {'enabled': True}), ('reserve', {'deviceId': target, 'slotStart': self.start})]:
+            with self.assertRaises(BusinessError) as error:
+                self.store.mutate(self.admin, action, secrets.token_hex(8), payload, target if action == 'device' else None)
+            self.assertEqual(error.exception.status, 404)
+        with self.assertRaises(BusinessError):
+            self.store.slots(target)
+        self.assertTrue(self.store.query('SELECT deleted_at FROM device WHERE id=?', (target,))[0]['deleted_at'])
+
+    def test_device_delete_preserves_history_and_blocks_active_reservations(self):
+        target = self.reserve()
+        with self.assertRaises(BusinessError) as error:
+            self.op('device_delete', 1)
+        self.assertEqual(error.exception.code, 'DEVICE_IN_USE')
+        self.now = self.now.replace(hour=9)
+        self.op('checkout', target)
+        with self.assertRaises(BusinessError):
+            self.op('device_delete', 1)
+        self.op('return', target)
+        self.op('device_delete', 1)
+        self.assertEqual(self.store.reservations(self.user)[0]['status'], 'RETURNED')
+        self.assertEqual(len(self.store.query('SELECT * FROM slot_occupancy')), 1)
+
+    def test_device_input_validation_and_migration(self):
+        for body in [{}, {'asset_code': ' ', 'name': 'a', 'category': 'b'}, {'asset_code': 'x', 'name': 1, 'category': 'b'}, {'asset_code': 'x', 'name': 'a'*121, 'category': 'b'}]:
+            with self.assertRaises(BusinessError) as error:
+                self.store.mutate(self.admin, 'device_create', secrets.token_hex(8), body)
+            self.assertEqual(error.exception.status, 400)
+        db = self.store.connect()
+        db.execute('ALTER TABLE device DROP COLUMN deleted_at')
+        db.execute('PRAGMA user_version=1')
+        db.close()
+        self.store.initialize()
+        self.store.initialize()
+        self.assertEqual(self.store.query('PRAGMA user_version')[0]['user_version'], 2)
+        self.assertEqual(self.store.query('SELECT asset_code,deleted_at FROM device')[0], {'asset_code': 'D1', 'deleted_at': None})
+
     def test_real_http_auth_csrf_and_roundtrip(self):
         server = make_server(self.store, port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -221,6 +276,24 @@ class PlatformTests(unittest.TestCase):
                 self.assertEqual(json.load(response)['id'], target)
             with request('/api/admin/audit',headers=headers) as response:
                 self.assertEqual(response.status, 403)
+            device_body = {'asset_code': 'HTTP-001', 'name': 'HTTP 设备', 'category': '测试'}
+            with request('/api/admin/devices', 'POST', device_body, headers) as response:
+                self.assertEqual(response.status, 403)
+            with request('/api/admin/devices/1', 'DELETE', {}, headers) as response:
+                self.assertEqual(response.status, 403)
+            with request('/api/session', 'POST', {'username':'user101','password':self.password}) as response:
+                admin_cookie = response.headers['Set-Cookie'].split(';')[0]
+                admin_csrf = json.load(response)['user']['csrf']
+            admin_headers = {'Cookie': admin_cookie, 'X-CSRF-Token': admin_csrf, 'Idempotency-Key': 'http-device'}
+            with request('/api/admin/devices', 'POST', device_body, admin_headers) as response:
+                self.assertEqual(response.status, 201)
+                device_id = json.load(response)['id']
+            with request(f'/api/admin/devices/{device_id}', 'DELETE', {}, admin_headers) as response:
+                self.assertEqual(response.status, 200)
+            with request('/api/devices', headers=admin_headers) as response:
+                listing = json.load(response)
+                self.assertEqual(listing['total'], 1)
+                self.assertNotIn(device_id, [d['id'] for d in listing['items']])
             with request('/api/session','DELETE',headers=headers) as response:
                 self.assertEqual(response.status, 200)
             with request('/api/devices',headers=headers) as response:

@@ -36,4 +36,3 @@ CREATE INDEX IF NOT EXISTS audit_target_created ON audit_event(target_id,created
 CREATE TABLE IF NOT EXISTS session (
  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES app_user(id), csrf TEXT NOT NULL, expires_at TEXT NOT NULL
 );
-PRAGMA user_version=1;

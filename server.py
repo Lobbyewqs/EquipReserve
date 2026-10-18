@@ -94,7 +94,7 @@ def make_server(store, host='127.0.0.1', port=8765):
                     params = parse_qs(urlsplit(self.path).query)
                     page = max(1, int(params.get('page', ['1'])[0]))
                     size = max(1, min(100, int(params.get('size', ['24'])[0])))
-                    data = {'items': store.query('SELECT * FROM device ORDER BY id LIMIT ? OFFSET ?', (size, (page - 1) * size)), 'total': store.query('SELECT count(*) AS n FROM device')[0]['n']}
+                    data = {'items': store.query('SELECT * FROM device WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?', (size, (page - 1) * size)), 'total': store.query('SELECT count(*) AS n FROM device WHERE deleted_at IS NULL')[0]['n']}
                 elif (match := re.fullmatch(r'/api/devices/(\d+)/slots', path)) and self.command == 'GET':
                     data = store.slots(int(match[1]))
                 elif path in ('/api/me/reservations', '/api/admin/reservations') and self.command == 'GET':
@@ -106,6 +106,10 @@ def make_server(store, host='127.0.0.1', port=8765):
                     operation, target = None, None
                     if path == '/api/reservations' and self.command == 'POST':
                         operation = 'reserve'
+                    elif path == '/api/admin/devices' and self.command == 'POST':
+                        operation = 'device_create'
+                    elif (match := re.fullmatch(r'/api/admin/devices/(\d+)', path)) and self.command == 'DELETE':
+                        operation, target = 'device_delete', int(match[1])
                     elif (match := re.fullmatch(r'/api/reservations/(\d+)/cancel', path)) and self.command == 'POST':
                         operation, target = 'cancel', int(match[1])
                     elif (match := re.fullmatch(r'/api/admin/reservations/(\d+)/(checkout|return)', path)) and self.command == 'POST':
