@@ -1,23 +1,26 @@
 # EquipReserve · 设备预约与借还平台
 
-状态：**本地 MVP 已实现，原项目计划尚未全部完成**。无需安装第三方依赖，使用 Python 标准库、SQLite 和原生 HTML/CSS/JavaScript。
+状态：**本地 MySQL 版已实现，原项目计划尚未全部完成**。使用 Python、MySQL 8.4 / InnoDB、PyMySQL 和原生 HTML/CSS/JavaScript；保留 SQLite 兼容模式用于回归与迁移。
 
 ## 启动
 
-1. 安装 Python 3.11 或更高版本。本机已用 Python 3.14.7 验证。
-2. 双击 `启动平台.cmd`。首次运行会要求输入至少 8 位的演示密码，输入不回显；程序不保存明文密码。
+1. 本机已安装 MySQL 8.4.9，并配置项目独立 Python 环境；复现安装见 `docs/MySQL安装与迁移.md`。
+2. 双击 `启动平台.cmd`，会自动启动本项目的 MySQL 实例和网页服务。本机原有数据已迁移，不会再次初始化密码。
 3. 浏览器自动打开 http://127.0.0.1:8765 。服务窗口保持开启；Ctrl+C 停止服务。
 4. 账号 `student`、`student2` 是普通用户，`admin` 是管理员。三个本地演示账号使用首次初始化设置的密码。不要将它们用于生产环境。
 
 也可在本目录执行：
 
 ```powershell
-python server.py --open
+.venv\Scripts\python.exe mysql_local.py
+.venv\Scripts\python.exe server.py --open
 # 端口被占用时
-python server.py --port 8770 --open
+.venv\Scripts\python.exe server.py --port 8770 --open
 ```
 
-数据保存在 `data/equipreserve.sqlite3`，重启保留。测试与预览使用独立数据库，不会初始化或修改正式演示数据。首次种子数据包含 6 台设备；后续启动不会覆盖现有账号或业务数据。备份时先停止服务，再复制整个 `data` 目录。
+当前数据保存在 MySQL 的 `equipreserve` 库，本机数据目录为 `data/mysql-server`。`data/mysql.json` 是项目连接配置，`data/mysql-admin.json` 是本机数据库管理配置，均不进入 Git。数据库仅监听 `127.0.0.1:3306`，不安装系统服务，随平台启动；关闭网页服务不会关闭数据库。原有账号密码、设备、预约与审计记录已迁移，SQLite 原文件和迁移前快照均保留。
+
+双击 `备份数据库.cmd` 可生成一致性的 SQL 备份，保存在 `data/backups`；运行中的 MySQL 不应通过直接复制数据文件备份。SQLite 旧文件仅代表迁移前状态，不能用它代替最新 MySQL 数据。测试使用随机独立数据库，不修改现有业务库。
 
 ## 已实现
 
@@ -46,7 +49,7 @@ python server.py --port 8770 --open
 ## 验证
 
 ```powershell
-python -m unittest -v test_platform
+.venv\Scripts\python.exe -m unittest -v test_platform test_mysql
 node --check static/app.js
 ```
 
@@ -56,20 +59,22 @@ Node 仅用于可选的 JavaScript 语法检查，运行平台不需要 Node。
 
 ## 与原计划的差异及下一阶段
 
-1. **数据库不是 MySQL。** SQLite `BEGIN IMMEDIATE` 将所有写事务串行化，未实现或验证计划中的 `SELECT ... FOR UPDATE` 设备行锁。唯一约束和事务可以验证本地业务不变量，但不能替代 MySQL 并发验收，也不宣称高吞吐。
+1. **已迁移到 MySQL。** InnoDB、READ COMMITTED、事务内幂等键唯一约束竞争、`SELECT ... FOR UPDATE` 设备锁与预约锁、占用唯一键共同保证核心不变量。同设备按设备行串行；不同设备可以独立写入。借出唯一约束使用生成列，替代 SQLite 部分唯一索引。仍未执行生产压测与掉电恢复验收。
 2. 当前使用 Python 内置 HTTP 服务，仅绑定 127.0.0.1 并限制 Host。没有生产部署模式，不支持直接对公网开放。正式版本需替换生产服务、配置 HTTPS / Secure Cookie、独立账号及运维方案。
 3. 设备维护支持添加、删除（归档）和启用/停用；资料编辑与账号管理待实现。管理员在设备中心点击“添加设备”，填写唯一资产编号、名称、分类和可选说明；设备卡片上的“删除设备”会移除列表展示并保留历史。存在待领取预约或未归还借用时禁止删除。归档资产编号不可复用。
-4. 启动时自动迁移到 user_version=2，增加设备归档时间字段，保留原有数据。升级后需重启服务并刷新网页；无需重新初始化数据库。
+4. 本次 MySQL 迁移会先创建 SQLite 快照，仅向空库导入，逐字段校验通过后才启用新连接配置。保留账号密码哈希和历史 ID；SQLite 兼容模式仍支持 user_version=2 迁移。
 5. 预约列表与审计只取最近记录，完整分页、登录失败审计、运维监控待完善。前端页面重载后不会恢复尚未收到响应的幂等键，后端仍保证已有键的重放。
 6. 登录页已检查浏览器实际显示；登录后页面尚未完成浏览器点击验收，相关业务以 API/数据库集成测试为证。
 
-建议下一阶段先确认是否转为 Spring Boot + MySQL。如果沿用原计划，应先落地 MySQL 迁移和事务适配，再在目标数据库上复跑并发及故障测试，最后完善设备维护和前端全流程验收。
+后续可继续完善资料编辑、账号管理、分页和前端全流程验收。目前沿用 Python 后端，未改写为 Spring Boot。
 
 ## 文件
 
 - `core.py`：时钟、认证、业务事务与状态机。
 - `server.py`：同源 HTTP API、CSRF 校验、定时扫描与启动入口。
-- `schema.sql`：表、外键、索引和唯一约束。
+- `schema.sql` / `schema_mysql.sql`：两种数据库的表、外键、索引和唯一约束。
+- `setup_mysql.py` / `mysql_local.py`：本机 MySQL 初始化与启动。
+- `migrate_mysql.py` / `backup_mysql.py`：数据迁移与一致性备份。
 - `static/`：登录、设备、预约、管理与审计界面。
-- `test_platform.py`：独立数据库与真实本地 HTTP 测试。
+- `test_platform.py` / `test_mysql.py`：SQLite / MySQL 独立数据库与真实本地 HTTP 测试。
 - `docs/`：验证、设计复盘和索引分析。

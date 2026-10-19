@@ -1,4 +1,4 @@
-"""Local edition: SQLite BEGIN IMMEDIATE serializes writes across processes."""
+"""Equipment transactions: SQLite writer serialization or MySQL device row locks."""
 import hashlib
 import hmac
 import json
@@ -29,11 +29,15 @@ class BusinessError(Exception):
 
 class Store:
     def __init__(self, path, clock=None, fault=None):
-        self.path = str(path)
+        self.mysql = isinstance(path, dict)
+        self.path = dict(path) if self.mysql else str(path)
         self.clock = clock or (lambda: datetime.now(UTC))
         self.fault = fault
 
     def connect(self):
+        if self.mysql:
+            from database import MySQLConnection
+            return MySQLConnection(self.path)
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON')
@@ -41,6 +45,17 @@ class Store:
         return db
 
     def initialize(self):
+        if self.mysql:
+            db = self.connect()
+            try:
+                for sql in Path(__file__).with_name('schema_mysql.sql').read_text(encoding='utf-8').split(';'):
+                    if sql.strip():
+                        db.execute(sql)
+                if not db.execute("SELECT 1 FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='device' AND CONSTRAINT_NAME='device_current_loan'").fetchone():
+                    db.execute('ALTER TABLE device ADD CONSTRAINT device_current_loan FOREIGN KEY(current_loan_id) REFERENCES reservation(id)')
+            finally:
+                db.close()
+            return
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         db = self.connect()
         try:
@@ -80,6 +95,20 @@ class Store:
             return [dict(row) for row in db.execute(sql, args)]
         finally:
             db.close()
+
+    def locked(self, db, sql, args=()):
+        return db.execute(sql + (' FOR UPDATE' if self.mysql else ''), args).fetchone()
+
+    def lock_device(self, db, device_id):
+        return self.locked(db, 'SELECT * FROM device WHERE id=?', (device_id,))
+
+    def lock_reservation(self, db, reservation_id):
+        # device_id is immutable. Discover it before taking device -> reservation locks.
+        row = db.execute('SELECT device_id FROM reservation WHERE id=?', (reservation_id,)).fetchone()
+        if not row:
+            return None, None
+        device = self.lock_device(db, row['device_id'])
+        return self.locked(db, 'SELECT * FROM reservation WHERE id=?', (reservation_id,)), device
 
     def audit(self, db, actor, action, target, before, after, request_id, reason=None):
         db.execute('INSERT INTO audit_event(actor_id,action,target_id,before_state,after_state,reason,request_id,created_at) VALUES(?,?,?,?,?,?,?,?)',
@@ -173,8 +202,11 @@ class Store:
         db = self.connect()
         try:
             db.execute('BEGIN IMMEDIATE')
+            if self.mysql:
+                db.execute('INSERT INTO idempotency_record VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE request_key=request_key',
+                           (actor['id'], operation, key, digest, 'null', 0))
             old = db.execute('SELECT * FROM idempotency_record WHERE user_id=? AND operation=? AND request_key=?', (actor['id'], operation, key)).fetchone()
-            if old:
+            if old and old['response_code']:
                 if old['request_hash'] != digest:
                     raise BusinessError('KEY_CONFLICT', '幂等键已用于不同请求')
                 db.commit()
@@ -184,7 +216,7 @@ class Store:
             now = stamp(self.clock())
             before = None
             if operation == 'reserve':
-                device = db.execute('SELECT * FROM device WHERE id=?', (payload['deviceId'],)).fetchone()
+                device = self.lock_device(db, payload['deviceId'])
                 if not device or device['deleted_at'] is not None:
                     raise BusinessError('NOT_FOUND', '设备不存在', 404)
                 if not device['enabled']:
@@ -219,7 +251,7 @@ class Store:
                 after = json.dumps(values, ensure_ascii=False)
                 result, status = {'id': target, **values, 'enabled': True}, 201
             elif operation == 'device_delete':
-                device = db.execute('SELECT * FROM device WHERE id=?', (target,)).fetchone()
+                device = self.lock_device(db, target)
                 if not device:
                     raise BusinessError('NOT_FOUND', '设备不存在', 404)
                 if payload:
@@ -232,7 +264,7 @@ class Store:
                     db.execute('UPDATE device SET deleted_at=?,enabled=0 WHERE id=?', (now, target))
                 result, status = {'id': target, 'deleted': True}, 200
             elif operation == 'device':
-                device = db.execute('SELECT * FROM device WHERE id=?', (target,)).fetchone()
+                device = self.lock_device(db, target)
                 if not device or device['deleted_at'] is not None:
                     raise BusinessError('NOT_FOUND', '设备不存在', 404)
                 if set(payload) != {'enabled'} or type(payload['enabled']) is not bool:
@@ -241,10 +273,9 @@ class Store:
                 db.execute('UPDATE device SET enabled=? WHERE id=?', (int(payload['enabled']), target))
                 result, status = {'id': target, 'enabled': payload['enabled']}, 200
             else:
-                row = db.execute('SELECT * FROM reservation WHERE id=?', (target,)).fetchone()
+                row, device = self.lock_reservation(db, target)
                 if not row or (actor['role'] != 'ADMIN' and row['user_id'] != actor['id']):
                     raise BusinessError('NOT_FOUND', '预约不存在或不可见', 404)
-                device = db.execute('SELECT * FROM device WHERE id=?', (row['device_id'],)).fetchone()
                 before = row['status']
                 after = before
                 if operation == 'cancel':
@@ -281,14 +312,20 @@ class Store:
                 db.execute('UPDATE reservation SET status=? WHERE id=?', (after, target))
                 result, status = {'id': target, 'status': after}, 200
             self.audit(db, actor['id'], operation, target, before, after, request_id)
-            db.execute('INSERT INTO idempotency_record VALUES(?,?,?,?,?,?)', (actor['id'], operation, key, digest, json.dumps(result), status))
+            if self.mysql:
+                db.execute('UPDATE idempotency_record SET response_json=?,response_code=? WHERE user_id=? AND operation=? AND request_key=?',
+                           (json.dumps(result), status, actor['id'], operation, key))
+            else:
+                db.execute('INSERT INTO idempotency_record VALUES(?,?,?,?,?,?)', (actor['id'], operation, key, digest, json.dumps(result), status))
             db.commit()
             return result, status
         except Exception as error:
             db.rollback()
+            if self.mysql and operation == 'device_create' and getattr(error, 'args', (None,))[0] == 1062:
+                error = BusinessError('ASSET_CODE_EXISTS', '资产编号已存在（含已删除设备），请使用唯一编号')
             if isinstance(error, BusinessError):
                 self.audit(db, actor['id'], operation, target, None, None, request_id, error.code + ': ' + error.message)
-            raise
+            raise error
         finally:
             db.close()
 
@@ -299,7 +336,7 @@ class Store:
             db = self.connect()
             try:
                 db.execute('BEGIN IMMEDIATE')
-                row = db.execute('SELECT * FROM reservation WHERE id=?', (candidate['id'],)).fetchone()
+                row, _ = self.lock_reservation(db, candidate['id'])
                 if row['status'] == 'CONFIRMED' and row['pickup_deadline'] <= stamp(self.clock()):
                     db.execute("UPDATE reservation SET status='EXPIRED' WHERE id=?", (row['id'],))
                     db.execute('DELETE FROM slot_occupancy WHERE reservation_id=?', (row['id'],))

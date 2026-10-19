@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from core import BusinessError, Store
+from database import configured_store
 
 ROOT = Path(__file__).parent
 
@@ -135,10 +136,10 @@ def make_server(store, host='127.0.0.1', port=8765):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
-    parser.add_argument('--db', default=str(ROOT / 'data' / 'equipreserve.sqlite3'))
+    parser.add_argument('--db', help='显式指定 SQLite 文件；默认优先使用已配置的 MySQL')
     parser.add_argument('--open', action='store_true', help='启动后打开本地页面')
     args = parser.parse_args()
-    store = Store(args.db)
+    store = configured_store(args.db)
     store.initialize()
     if not store.query('SELECT id FROM app_user LIMIT 1'):
         import getpass

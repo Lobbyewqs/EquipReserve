@@ -4,12 +4,13 @@ import secrets
 from pathlib import Path
 
 from core import Store, password_hash
+from database import configured_store
 
 
 def reset_password(store, username, password):
     if len(password) < 8:
         raise ValueError('密码至少需要 8 位。')
-    if not Path(store.path).is_file():
+    if not store.mysql and not Path(store.path).is_file():
         raise ValueError('尚未初始化数据库，请先运行启动平台。')
     hashed = password_hash(password)
     db = store.connect()
@@ -31,7 +32,7 @@ def reset_password(store, username, password):
 
 
 def main():
-    store = Store(Path(__file__).parent / 'data' / 'equipreserve.sqlite3')
+    store = configured_store()
     print('本地账号密码重置：保留预约和借还记录。')
     print('演示账号：student / student2 / admin；每次只修改一个账号。')
     try:

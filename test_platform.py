@@ -25,7 +25,7 @@ class PlatformTests(unittest.TestCase):
         test_root.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=test_root)
         self.now = datetime(2026, 10, 17, 8, tzinfo=SHANGHAI)
-        self.store = Store(Path(self.tmp.name) / 'test.db', lambda: self.now)
+        self.store = self.make_store(Path(self.tmp.name) / 'test.db', lambda: self.now)
         self.store.initialize()
         db = self.store.connect()
         for n in range(1, 102):
@@ -38,6 +38,9 @@ class PlatformTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def make_store(self, path, clock):
+        return Store(path, clock)
 
     def reserve(self, user=None, key=None, start=None):
         return self.store.mutate(user or self.user, 'reserve', key or secrets.token_hex(8), {'deviceId': 1, 'slotStart': start or self.start})[0]['id']
@@ -235,13 +238,15 @@ class PlatformTests(unittest.TestCase):
             with self.assertRaises(BusinessError) as error:
                 self.store.mutate(self.admin, 'device_create', secrets.token_hex(8), body)
             self.assertEqual(error.exception.status, 400)
-        db = self.store.connect()
-        db.execute('ALTER TABLE device DROP COLUMN deleted_at')
-        db.execute('PRAGMA user_version=1')
-        db.close()
+        if not self.store.mysql:
+            db = self.store.connect()
+            db.execute('ALTER TABLE device DROP COLUMN deleted_at')
+            db.execute('PRAGMA user_version=1')
+            db.close()
         self.store.initialize()
         self.store.initialize()
-        self.assertEqual(self.store.query('PRAGMA user_version')[0]['user_version'], 2)
+        if not self.store.mysql:
+            self.assertEqual(self.store.query('PRAGMA user_version')[0]['user_version'], 2)
         self.assertEqual(self.store.query('SELECT asset_code,deleted_at FROM device')[0], {'asset_code': 'D1', 'deleted_at': None})
 
     def test_real_http_auth_csrf_and_roundtrip(self):
